@@ -1,0 +1,330 @@
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(caret)
+library(zoo)
+library(scales)
+library(data.table)
+library(readr)
+
+```
+
+```{r}
+# Fix: Load and prepare data with fallback for missing Region column
+
+load_and_prepare_data <- function(file_path = NULL) {
+  if (is.null(file_path)) {
+    file_path <- "C:/Users/91886/Downloads/Agrofood_co2_emission_with_regions.csv"
+  }
+
+  cat("📄 Reading file:", basename(file_path), "\n")
+
+  checkpoint_data <- load_checkpoint("data_prep", 4)
+  if (!is.null(checkpoint_data)) return(checkpoint_data)
+
+  df <- read_csv(file_path, show_col_types = FALSE)
+  cat("Loaded dataset with", nrow(df), "rows and", ncol(df), "columns\n")
+
+  # Fallback if 'Region' is missing
+  if (!"Region" %in% names(df)) {
+    warning("⚠️ Column 'Region' not found — using 'Area' as a substitute for regional grouping.")
+    df$Region <- df$Area
+  }
+
+  exclude_cols <- c('Region', 'Area', 'Year', 'Rural population', 'Urban population',
+                    'Total Population - Male', 'Total Population - Female',
+                    'Average Temperature °C', 'total_emission')
+  emission_cols <- setdiff(names(df), exclude_cols)
+
+  original_df <- df
+  df_processed <- df
+
+  df_processed$Region_code <- as.numeric(as.factor(df_processed$Region))
+  df_processed$Area_code <- as.numeric(as.factor(df_processed$Area))
+
+  if (all(c('Rural population', 'Urban population') %in% names(df))) {
+    total_pop <- df_processed$`Rural population` + df_processed$`Urban population`
+    df_processed$Rural_ratio <- df_processed$`Rural population` / total_pop
+    df_processed$Rural_ratio[is.na(df_processed$Rural_ratio)] <- 0.5
+  }
+
+  numeric_features <- c('Year', 'Rural population', 'Urban population',
+                        'Total Population - Male', 'Total Population - Female',
+                        'Average Temperature °C', 'total_emission')
+  numeric_features <- intersect(numeric_features, names(df))
+
+  for (feat in numeric_features) {
+    df_processed[[feat]][is.na(df_processed[[feat]])] <- median(df_processed[[feat]], na.rm = TRUE)
+  }
+
+  scalers <- list()
+  for (feat in numeric_features) {
+    scaler <- preProcess(df_processed[, feat, drop = FALSE], method = c("range"))
+    df_processed[[paste0(feat, '_scaled')]] <- predict(scaler, df_processed[, feat, drop = FALSE])[,1]
+    scalers[[feat]] <- scaler
+  }
+
+  # Safe NA replacement for all _scaled columns
+  scaled_cols <- grep("_scaled$", names(df_processed), value = TRUE)
+  for (col in scaled_cols) {
+    df_processed[[col]][is.na(df_processed[[col]])] <- 0
+  }
+
+  save_checkpoint("data_prep", df, df_processed, emission_cols, original_df)
+  return(list(df, df_processed, emission_cols, original_df))
+}
+
+```
+
+```{r}
+# Analyze zero patterns
+analyze_zero_patterns <- function(df, emission_cols) {
+  checkpoint_data <- load_checkpoint("zero_patterns", 2)
+  if (!is.null(checkpoint_data)) return(checkpoint_data)
+
+  zero_stats <- list()
+  zero_by_region <- list()
+
+  for (col in emission_cols) {
+    zero_mask <- df[[col]] == 0
+    zero_percent <- mean(zero_mask, na.rm = TRUE) * 100
+    mean_nonzero <- mean(df[[col]][df[[col]] > 0], na.rm = TRUE)
+
+    zero_stats[[col]] <- list(
+      zero_count = sum(zero_mask, na.rm = TRUE),
+      zero_percent = zero_percent,
+      mean_nonzero = mean_nonzero
+    )
+
+    zero_by_region[[col]] <- tapply(df[[col]] == 0, df$Region, function(x) mean(x, na.rm = TRUE) * 100)
+  }
+
+  summary_df <- bind_rows(zero_stats, .id = "Emission") %>% arrange(desc(zero_percent))
+  print(summary_df)
+
+  save_checkpoint("zero_patterns", zero_stats, zero_by_region)
+  list(zero_stats, zero_by_region)
+}
+```
+
+```{r}
+# Identify suspicious zeros
+identify_suspicious_zeros <- function(df, emission_cols, zero_by_region) {
+  checkpoint_data <- load_checkpoint("suspicious_zeros", 1)
+  if (!is.null(checkpoint_data)) return(checkpoint_data[[1]])
+
+  suspicious_zeros <- list()
+  for (col in emission_cols) {
+    suspicious_zeros[[col]] <- rep(FALSE, nrow(df))
+    for (region in unique(df$Region)) {
+      region_mask <- df$Region == region
+      region_zero_percent <- zero_by_region[[col]][[region]]
+      if (!is.na(region_zero_percent) && region_zero_percent > 5 && region_zero_percent < 95) {
+        suspicious_zeros[[col]] <- suspicious_zeros[[col]] | (df[[col]] == 0 & region_mask)
+      }
+    }
+
+    for (area in unique(df$Area)) {
+      area_data <- df %>% filter(Area == area) %>% arrange(Year)
+      if (nrow(area_data) > 2) {
+        for (i in 2:(nrow(area_data) - 1)) {
+          if (area_data[[col]][i] == 0 && area_data[[col]][i - 1] > 0 && area_data[[col]][i + 1] > 0) {
+            suspicious_zeros[[col]][area_data$Year[i]] <- TRUE
+          }
+        }
+      }
+    }
+  }
+  save_checkpoint("suspicious_zeros", suspicious_zeros)
+  suspicious_zeros
+}
+
+```
+
+```{r}
+# Apply linear interpolation
+apply_linear_interpolation <- function(df, emission_cols, suspicious_zeros) {
+  checkpoint_data <- load_checkpoint("interpolation", 3)
+  if (!is.null(checkpoint_data)) return(checkpoint_data)
+
+  interpolated_df <- df
+  confidence <- matrix(NA, nrow = nrow(df), ncol = length(emission_cols))
+  colnames(confidence) <- emission_cols
+
+  for (col in emission_cols) {
+    interpolated <- df[[col]]
+    for (area in unique(df$Area)) {
+      area_idx <- which(df$Area == area)
+      time_series <- interpolated[area_idx]
+      flags <- is.na(time_series) | suspicious_zeros[[col]][area_idx]
+      if (sum(!is.na(time_series[!flags])) >= 2) {
+        time_series[flags] <- na.approx(time_series, x = df$Year[area_idx], na.rm = FALSE)
+        interpolated[area_idx] <- time_series
+        confidence[area_idx[flags], col] <- 1 - (diff(range(df$Year[area_idx][!is.na(time_series)])) / 10)
+      }
+    }
+    interpolated_df[[col]] <- interpolated
+  }
+
+  interpolated_mask <- !is.na(confidence)
+  save_checkpoint("interpolation", interpolated_df, confidence, interpolated_mask)
+  list(interpolated_df, confidence, interpolated_mask)
+}
+
+```
+
+```{r}
+# Apply KNN imputation
+apply_knn_imputation <- function(df, df_processed, emission_cols, interpolated_mask, suspicious_zeros) {
+  checkpoint_data <- load_checkpoint("knn", 2)
+  if (!is.null(checkpoint_data)) return(checkpoint_data)
+
+  knn_df <- df
+  knn_confidence <- matrix(NA, nrow = nrow(df), ncol = length(emission_cols))
+  colnames(knn_confidence) <- emission_cols
+
+  features <- df_processed %>%
+    select(ends_with("_scaled"), Rural_ratio, Region_code, Area_code) %>%
+    mutate_all(~replace_na(., 0))
+
+  for (col in emission_cols) {
+    missing_mask <- (is.na(df[[col]]) | suspicious_zeros[[col]]) & !interpolated_mask[, col]
+    if (!any(missing_mask)) next
+
+    train_idx <- which(!(missing_mask | is.na(df[[col]]) | suspicious_zeros[[col]]))
+    test_idx <- which(missing_mask)
+
+    if (length(train_idx) >= 3 && length(test_idx) > 0) {
+      X_train <- features[train_idx, ]
+      y_train <- df[[col]][train_idx]
+      X_test <- features[test_idx, ]
+
+      knn_result <- knn.reg(train = X_train, test = X_test, y = y_train, k = 5)
+      knn_df[[col]][test_idx] <- knn_result$pred
+      knn_confidence[test_idx, col] <- 1 - knn_result$PRESS / (length(test_idx) + 1e-5)
+    }
+  }
+
+  save_checkpoint("knn", knn_df, knn_confidence)
+  list(knn_df, knn_confidence)
+}
+
+```
+
+```{r}
+# Combine interpolation and KNN results
+combine_imputed_results <- function(df, interpolated_df, interpolated_mask, interpolation_confidence,
+                                    knn_df, knn_confidence, emission_cols) {
+  final_df <- df
+  method_used <- matrix("original", nrow = nrow(df), ncol = length(emission_cols))
+  colnames(method_used) <- emission_cols
+  final_confidence <- matrix(1, nrow = nrow(df), ncol = length(emission_cols))
+  colnames(final_confidence) <- emission_cols
+
+  for (col in emission_cols) {
+    interp_idx <- which(interpolated_mask[, col])
+    final_df[interp_idx, col] <- interpolated_df[interp_idx, col]
+    method_used[interp_idx, col] <- "interpolation"
+    final_confidence[interp_idx, col] <- interpolation_confidence[interp_idx, col]
+
+    knn_idx <- which(!is.na(knn_df[[col]]) & is.na(df[[col]]) & !(interpolated_mask[, col]))
+    final_df[knn_idx, col] <- knn_df[knn_idx, col]
+    method_used[knn_idx, col] <- "knn"
+    final_confidence[knn_idx, col] <- knn_confidence[knn_idx, col]
+  }
+
+  list(final_df = final_df, method_used = method_used, final_confidence = final_confidence)
+}
+```
+
+```{r}
+# Final evaluation function
+
+evaluate_imputation <- function(original_df, final_df, emission_cols) {
+  cat("\nImputation Summary:\n")
+  for (col in emission_cols) {
+    original_zeros <- sum(original_df[[col]] == 0, na.rm = TRUE)
+    original_missing <- sum(is.na(original_df[[col]]))
+    final_zeros <- sum(final_df[[col]] == 0, na.rm = TRUE)
+
+    changed <- original_zeros - final_zeros
+    imputed_count <- sum((is.na(original_df[[col]]) | original_df[[col]] == 0) &
+                         !(is.na(final_df[[col]]) | final_df[[col]] == 0))
+
+    imputed_values <- final_df[[col]][(is.na(original_df[[col]]) | original_df[[col]] == 0) &
+                                      !(is.na(final_df[[col]]) | final_df[[col]] == 0)]
+
+    cat(sprintf("%s:\n  - Original zeros: %d, Final zeros: %d, Changed: %d\n", col, original_zeros, final_zeros, changed))
+    cat(sprintf("  - Original missing: %d, Total imputed: %d\n", original_missing, imputed_count))
+    if (length(imputed_values) > 0) {
+      cat(sprintf("  - Imputed values: min=%.2f, mean=%.2f, max=%.2f\n",
+                  min(imputed_values), mean(imputed_values), max(imputed_values)))
+    }
+  }
+}
+```
+
+```{r}
+process_agrofood_emissions <- function(file_path = NULL) {
+  start_time <- Sys.time()
+
+  cat("Step 1/6: Loading and preparing data...\n")
+  data <- load_and_prepare_data(file_path)
+  df <- data[[1]]
+  df_processed <- data[[2]]
+  emission_cols <- data[[3]]
+  original_df <- data[[4]]
+
+  cat("Step 2/6: Analyzing zero patterns...\n")
+  zero_results <- analyze_zero_patterns(df, emission_cols)
+  zero_stats <- zero_results[[1]]
+  zero_by_region <- zero_results[[2]]
+
+  cat("Step 3/6: Identifying suspicious zeros...\n")
+  suspicious_zeros <- identify_suspicious_zeros(df, emission_cols, zero_by_region)
+
+  cat("Step 4/6: Applying linear interpolation...\n")
+  interp_results <- apply_linear_interpolation(df, emission_cols, suspicious_zeros)
+  interpolated_df <- interp_results[[1]]
+  interpolation_confidence <- interp_results[[2]]
+  interpolated_mask <- interp_results[[3]]
+
+  cat("Step 5/6: Applying KNN imputation...\n")
+  knn_results <- apply_knn_imputation(df, df_processed, emission_cols, interpolated_mask, suspicious_zeros)
+  knn_df <- knn_results[[1]]
+  knn_confidence <- knn_results[[2]]
+
+  cat("Step 6/6: Combining results...\n")
+  combined <- combine_imputed_results(df, interpolated_df, interpolated_mask,
+                                      interpolation_confidence, knn_df, knn_confidence, emission_cols)
+
+  final_df <- combined$final_df
+  method_used <- combined$method_used
+  final_confidence <- combined$final_confidence
+
+  evaluate_imputation(original_df, final_df, emission_cols)
+
+  write_csv(final_df, "C:/Users/91886/Downloads/Agrofood_co2_emission_imputed_Linear_KNN.csv")
+shell.exec("C:/Users/91886/Downloads/Agrofood_co2_emission_imputed_Linear_KNN.csv")
+  write_csv(as.data.frame(method_used), "C:/Users/91886/Downloads/imputation_methods.csv")
+shell.exec("C:/Users/91886/Downloads/imputation_methods.csv")
+  write_csv(as.data.frame(final_confidence), "C:/Users/91886/Downloads/imputation_confidence.csv")
+shell.exec("C:/Users/91886/Downloads/imputation_confidence.csv")
+
+
+  end_time <- Sys.time()
+  cat("\nTotal processing time:", round(difftime(end_time, start_time, units = "secs"), 2), "seconds\n")
+
+  return(list(final_df = final_df, method_used = method_used, final_confidence = final_confidence))
+}
+```
+
+
+
+
+
+
+
+;

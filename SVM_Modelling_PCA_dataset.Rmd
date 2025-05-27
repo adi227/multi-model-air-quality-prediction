@@ -1,0 +1,163 @@
+```{r}
+# Step 0: Load Libraries
+library(readr)
+library(readxl)
+library(dplyr)
+library(caret)
+library(ggplot2)
+library(e1071)
+library(magrittr)
+library(purrr)
+```
+
+```{r}
+# Load PCA scores dataset (already processed with dimensionality reduction)
+pca_data <- read.csv("C:/Users/91886/Downloads/PCA_scores_with_clusters_Final.csv")
+
+# Load the original dataset to extract the target variable
+raw_data <- read_excel("C:/Users/91886/Downloads/Agrofood_co2_emission_Final.xlsx", 
+                       sheet = "Agrofood_co2_emission_imputedKN")
+#Note:- Change the location to you default saved location of dataset to open it.
+```
+
+```{r}
+# Step 2: Add total_emission as target to PCA data
+pca_data$total_emission <- raw_data$total_emission
+```
+
+```{r}
+# Step 3: Prepare data
+X <- pca_data %>% select(starts_with("PC"))
+y <- pca_data$total_emission
+```
+
+```{r}
+# Step 4: Train-Test Split (70/30)
+set.seed(42)
+train_index <- createDataPartition(y, p = 0.7, list = FALSE)
+X_train <- X[train_index, ]
+y_train <- y[train_index]
+X_test <- X[-train_index, ]
+y_test <- y[-train_index]
+```
+
+```{r}
+# Step 5: Feature Scaling
+pre_proc <- preProcess(X_train, method = c("center", "scale"))
+X_train_scaled <- predict(pre_proc, X_train)
+X_test_scaled <- predict(pre_proc, X_test)
+
+# Step 6: Hyperparameter Tuning with CV Grid
+tune_grid <- expand.grid(C = c(1, 10), sigma = c(0.01, 0.1))
+
+set.seed(42)
+svm_tuned <- train(
+  x = X_train_scaled, y = y_train,
+  method = "svmRadial",
+  trControl = trainControl(method = "cv", number = 5),
+  tuneGrid = tune_grid
+)
+```
+
+```{r}
+# Step 7: Predict Using Tuned Model
+y_pred <- predict(svm_tuned, newdata = X_test_scaled)
+```
+
+```{r}
+# Step 8: Evaluate Model Performance
+mse <- mean((y_test - y_pred)^2)
+rmse <- sqrt(mse)
+mae <- mean(abs(y_test - y_pred))
+r2 <- 1 - sum((y_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+
+cat("Performance Metrics (PCA + SVM):\n")
+cat(sprintf("MSE: %.2f\nRMSE: %.2f\nMAE: %.2f\nR²: %.4f\n", mse, rmse, mae, r2))
+```
+```{r}
+# Step 9.1: Training R² (Overfitting Check)
+y_train_pred <- predict(svm_tuned, newdata = X_train_scaled)
+train_r2 <- 1 - sum((y_train - y_train_pred)^2) / sum((y_train - mean(y_train))^2)
+cat(sprintf("Training R²: %.4f\n", train_r2))
+```
+```{r}
+# Step 9.2: Support Vector Count
+num_sv <- length(svm_tuned$finalModel@SVindex)
+num_train <- nrow(X_train_scaled)
+cat(sprintf("Support Vectors: %d\nTraining Obs: %d\nSV Ratio: %.2f%%\n",
+            num_sv, num_train, 100 * num_sv / num_train))
+```
+
+```{r}
+# Step 9.3: Learning Curve
+learning_curve <- function(fractions = seq(0.1, 1, by = 0.1)) {
+  map_dfr(fractions, function(frac) {
+    idx <- sample(seq_len(nrow(X_train_scaled)), size = floor(frac * nrow(X_train_scaled)))
+    model <- train(
+      x = X_train_scaled[idx, ],
+      y = y_train[idx],
+      method = "svmRadial",
+      tuneGrid = svm_tuned$bestTune,
+      trControl = trainControl(method = "none")
+    )
+    data.frame(
+      TrainSize = length(idx),
+      TrainRMSE = sqrt(mean((predict(model, X_train_scaled[idx, ]) - y_train[idx])^2)),
+      TestRMSE  = sqrt(mean((predict(model, X_test_scaled) - y_test)^2))
+    )
+  })
+}
+
+curve_df <- learning_curve()
+
+ggplot(curve_df, aes(x = TrainSize)) +
+  geom_line(aes(y = TrainRMSE, color = "Train RMSE")) +
+  geom_line(aes(y = TestRMSE, color = "Test RMSE")) +
+  labs(title = "Learning Curve (PCA + SVM)", x = "Training Size", y = "RMSE") +
+  scale_color_manual(values = c("Train RMSE" = "steelblue", "Test RMSE" = "darkred")) +
+  theme_minimal()
+
+```
+
+```{r}
+# Step 10: Actual vs Predicted Plot
+results <- data.frame(Actual = y_test, Predicted = y_pred)
+
+ggplot(results, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.6, color = "darkblue") +
+  geom_abline(linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "PCA + SVM: Actual vs Predicted CO₂ Emissions",
+       x = "Actual CO₂ Emissions", y = "Predicted CO₂ Emissions")
+```
+
+```{r}
+# Step 11: Residual Plot
+residuals_df <- data.frame(Predicted = y_pred, Residuals = y_test - y_pred)
+
+ggplot(residuals_df, aes(x = Predicted, y = Residuals)) +
+  geom_point(alpha = 0.6, color = "tomato") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  theme_minimal() +
+  labs(title = "Residual Plot: PCA-based SVM Model",
+       x = "Predicted CO₂ Emissions", y = "Residuals (Actual - Predicted)")
+
+# Step 12: Feature Influence from Support Vector Variability
+support_indices <- svm_tuned$finalModel@SVindex
+X_support <- X_train_scaled[support_indices, ]
+
+feature_sd <- apply(X_support, 2, sd)
+importance_df <- data.frame(Feature = names(feature_sd), Overall = feature_sd)
+
+top_features <- importance_df %>%
+  arrange(desc(Overall)) %>%
+  head(15)
+
+ggplot(top_features, aes(x = reorder(Feature, Overall), y = Overall)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 15 PCA Features by Variability in Support Vectors",
+       x = "PCA Features", y = "Standard Deviation Across SVs")
+```
+

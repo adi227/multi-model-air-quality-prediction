@@ -1,0 +1,131 @@
+```{r}
+# Load required libraries for data manipulation, modeling, and visualization
+library(readr)          # for reading CSV files
+library(dplyr)          # for data wrangling
+library(caret)          # for data partitioning
+library(randomForest)   # for Random Forest model
+library(ggplot2)        # for plotting
+library(ggthemes)       # for additional plot themes
+library(readxl)         # for reading Excel files
+
+```
+
+```{r}
+# Read in the PCA-transformed dataset
+pca_data <- read.csv("C:/Users/91886/Downloads/PCA_scores_with_clusters_Final.csv")
+
+# Read in the original dataset to access the target variable (total_emission)
+original_data <- read_excel("C:/Users/91886/Downloads/Agrofood_co2_emission_Final.xlsx", 
+                       sheet = "Agrofood_co2_emission_imputedKN")
+
+# Add the target variable to the PCA dataset
+pca_data$total_emission <- original_data$total_emission
+
+```
+
+```{r}
+# Remove categorical/identifier columns that are not PCA-based
+# These are not needed for modeling and would break correlation/matrix operations
+pca_data <- pca_data %>% select(-Region, -cluster)
+
+# Confirm structure to ensure dataset is numeric and well-shaped
+str(pca_data)
+
+```
+
+```{r}
+# Step X: Split PCA Features and Target into Training, Validation, and Test Sets
+# ======================================================
+
+# Separate features (PCA components) and target variable (CO₂ emissions)
+features <- pca_data %>% select(-total_emission)
+target <- pca_data$total_emission
+
+# First Split: 80% TrainVal (Training + Validation), 20% Test
+set.seed(123)
+trainValIndex <- createDataPartition(target, p = 0.8, list = FALSE)
+trainVal_data <- features[trainValIndex, ]
+trainVal_target <- target[trainValIndex]
+test_data <- features[-trainValIndex, ]
+test_target <- target[-trainValIndex]
+
+# Second Split: 75% Train (60% overall), 25% Validation (20% overall) from TrainVal
+set.seed(123)
+trainIndex <- createDataPartition(trainVal_target, p = 0.75, list = FALSE)
+train_data <- trainVal_data[trainIndex, ]
+train_target <- trainVal_target[trainIndex]
+validation_data <- trainVal_data[-trainIndex, ]
+validation_target <- trainVal_target[-trainIndex]
+
+# Check dataset sizes
+cat("Training Size: ", nrow(train_data), "\n")
+cat("Validation Size: ", nrow(validation_data), "\n")
+cat("Testing Size: ", nrow(test_data), "\n")
+
+
+```
+
+```{r}
+# Step X+1: Train Random Forest Model and Predict on Validation Set
+# ======================================================
+
+# Fit Random Forest model with 300 trees
+rf_model <- randomForest(x = train_data, y = train_target, ntree = 300, importance = TRUE)
+
+# Predict CO₂ emissions on Validation set
+val_preds <- predict(rf_model, newdata = validation_data)
+
+
+```
+
+```{r}
+# Step X+2: Evaluate Model on Validation and Test Sets
+# ======================================================
+
+# Validation Metrics
+val_mse <- mean((validation_target - val_preds)^2)
+val_rmse <- sqrt(val_mse)
+val_mae <- mean(abs(validation_target - val_preds))
+val_r2 <- 1 - sum((validation_target - val_preds)^2) / sum((validation_target - mean(validation_target))^2)
+
+cat("📊 Validation Metrics (PCA Features):\n")
+cat(sprintf("Validation MSE: %.2f\nValidation RMSE: %.2f\nValidation MAE: %.2f\nValidation R²: %.4f\n\n", 
+             val_mse, val_rmse, val_mae, val_r2))
+
+# Final Prediction on Test Set
+rf_preds <- predict(rf_model, newdata = test_data)
+
+# Test Metrics
+test_mse <- mean((test_target - rf_preds)^2)
+test_rmse <- sqrt(test_mse)
+test_mae <- mean(abs(test_target - rf_preds))
+test_r2 <- 1 - sum((test_target - rf_preds)^2) / sum((test_target - mean(test_target))^2)
+
+cat("📊 Final Test Metrics (PCA Features):\n")
+cat(sprintf("Test MSE: %.2f\nTest RMSE: %.2f\nTest MAE: %.2f\nTest R²: %.4f\n", 
+             test_mse, test_rmse, test_mae, test_r2))
+
+
+```
+
+```{r}
+# Extract variable importance scores from the trained Random Forest model
+importance_df <- as.data.frame(importance(rf_model))
+
+# Add PCA component names as a column
+importance_df$Component <- rownames(importance_df)
+
+# Sort by importance using IncNodePurity
+importance_df <- importance_df %>% arrange(desc(IncNodePurity))
+
+# Plot the top 15 most important PCA components
+ggplot(importance_df[1:15, ], aes(x = reorder(Component, IncNodePurity), y = IncNodePurity)) +
+  geom_col(fill = "#0072B2") +
+  coord_flip() +
+  theme_economist() +
+  labs(title = "Top 15 PCA Components - Random Forest Importance",
+       x = "Principal Component",
+       y = "Importance (IncNodePurity)")
+
+```
+

@@ -1,0 +1,385 @@
+---
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+
+```{r}
+# Load required libraries
+library(readxl)
+library(corrplot)  
+library(tidyverse)
+library(scales)
+library(readr)
+library(data.table)       # For fast data reading
+library(dplyr)            # Data manipulation
+library(tidyr)            # Handling missing values
+library(stringr)          # String operations
+library(ggplot2)          # Plotting 
+library(psych)            # For descriptive stats
+```
+
+```{r}
+# 2. Create new derived features
+data <- read_excel("C:/Users/91886/Downloads/Agrofood_co2_emission_Final.xlsx")
+
+# Check column names to ensure consistency
+print(colnames(data))
+
+# Create derived columns
+data <- data %>%
+  mutate(
+    pop_tot = `Total Population - Male` + `Total Population - Female`,
+    per_capita_emission = ifelse(pop_tot > 0, total_emission / pop_tot, NA),
+    UrbanPop_ratio = ifelse(pop_tot > 0, `Urban population` / pop_tot, NA)
+  )
+```
+```{r}
+# 3. Explore structure
+str(data)
+summary(data)
+
+```
+```{r}
+missing_counts <- sapply(data, function(x) sum(is.na(x)))
+missing_df <- data.frame(Feature = names(missing_counts), Missing = missing_counts)
+missing_df <- missing_df %>% arrange(desc(Missing))
+```
+
+```{r}
+# 5. Optional: Drop columns with >30% missing data
+threshold <- 0.3 * nrow(data)
+data_clean <- data %>% select(where(~ sum(is.na(.)) < threshold))
+```
+
+```{r}
+# 6. Fill remaining NAs with median (numeric) or mode (categorical)
+numeric_cols <- sapply(data_clean, is.numeric)
+data_clean[numeric_cols] <- lapply(data_clean[numeric_cols], function(x) {
+  ifelse(is.na(x), median(x, na.rm = TRUE), x)
+})
+```
+
+```{r}
+# 7. Convert categorical columns
+data_clean$Area <- as.factor(data_clean$Area)
+data_clean$Region <- as.factor(data_clean$Region)
+```
+
+
+```{r}
+# 8. Final check
+cat("Final shape after preprocessing:", dim(data_clean), "\n")
+summary(data_clean)
+```
+
+```{r}
+# 1. Global CO₂ Emission Trend Over Time
+global_emission <- data_clean %>%
+  group_by(Year) %>%
+  summarise(total_emission_sum = sum(total_emission, na.rm = TRUE))
+
+ggplot(global_emission, aes(x = Year, y = total_emission_sum)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Global CO2 Emissions Over Time",
+       x = "Year", y = "Total Emission (kilotonnes)")
+```
+
+```{r}
+# 2. Emissions by Region in a Specific Year (e.g., 2020)
+region_emission_2020 <- data_clean %>%
+  filter(Year == 2020, !is.na(Region)) %>%
+  group_by(Region) %>%
+  summarise(
+    total_emission = sum(total_emission, na.rm = TRUE),
+    per_capita_emission = mean(per_capita_emission, na.rm = TRUE)
+  )
+
+```
+
+
+```{r}
+# Bar Plot: Total Emissions by Region
+ggplot(region_emission_2020, aes(x = reorder(Region, total_emission), y = total_emission)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Total CO₂ Emissions by Region (2020)",
+       x = "Region", y = "Total Emission")
+```
+
+```{r}
+# 3. CO₂ Emissions vs. Average Temperature by Region
+ggplot(data_clean %>% filter(!is.na(Region)),
+       aes(x = total_emission, y = `Average Temperature ¬∞C`, color = Region)) +
+  geom_point(alpha = 0.6) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(title = "CO₂ Emission vs Average Temperature by Region",
+       x = "Total Emission", y = "Average Temperature (°C)")
+
+```
+
+```{r}
+# 4. Correlation Heatmap (numeric variables only)
+numeric_data <- data_clean %>%
+  select(where(is.numeric)) %>%
+  drop_na()
+
+cor_matrix <- cor(numeric_data, use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "lower", tl.cex = 0.7)
+```
+
+```{r}
+# 5. Top 20 Emitting Countries (1990–2020 cumulative)
+top_emitters <- data_clean %>%
+  group_by(Area) %>%
+  summarise(total_emission_sum = sum(total_emission, na.rm = TRUE)) %>%
+  arrange(desc(total_emission_sum)) %>%
+  slice_head(n = 20)
+
+ggplot(top_emitters, aes(x = reorder(Area, total_emission_sum), y = total_emission_sum)) +
+  geom_bar(stat = "identity", fill = "tomato") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Top 20 Emitting Countries (1990–2020)",
+       x = "Country", y = "Total Emission")
+```
+
+```{r}
+# 6. Boxplot: Emission Distribution by Year
+ggplot(data_clean %>% filter(Year %in% c(1990, 2000, 2010, 2020)),
+       aes(x = as.factor(Year), y = total_emission)) +
+  geom_boxplot(fill = "skyblue") +
+  scale_y_log10() +
+  labs(title = "Emission Distribution Over Time",
+       x = "Year", y = "Total Emission (log scale)")
+```
+
+```{r}
+# 7. Temperature and Emission Correlation Coefficient
+cor_result <- cor.test(data_clean$total_emission, data_clean$`Average Temperature ¬∞C`, use = "complete.obs")
+print(cor_result)
+
+```
+
+```{r}
+# Make a copy of the original data to work on
+pca_data <- data_clean
+
+# Drop non-numeric, identifier, or redundant columns
+non_features <- c("Region", "Area", "Year", "pop_tot", "per_capita_emission", "total_emission")
+pca_data <- pca_data %>% select(-all_of(non_features))
+
+# Ensure all remaining columns are numeric (required for PCA)
+pca_data <- pca_data %>% select(where(is.numeric))
+
+# Drop rows with any missing values (or use imputation if preferred)
+pca_data <- pca_data %>% drop_na()
+
+```
+
+```{r}
+# Scale the features (mean = 0, sd = 1)
+pca_scaled <- scale(pca_data)
+
+# Optional: verify result
+summary(pca_scaled)
+
+```
+
+```{r}
+prcomp(pca_scaled)
+
+```
+
+# PCA Implementation in R
+
+```{r}
+#install.packages("factoextra")  for PCA visualization
+#install.packages("FactoMineR")  for PCA analysis (optional)
+
+library(factoextra)
+library(FactoMineR)
+
+```
+
+```{r}
+# Perform PCA on standardized data
+pca_result <- prcomp(pca_scaled, center = TRUE, scale. = TRUE)
+
+# Check summary of principal components
+summary(pca_result)
+
+```
+
+```{r}
+fviz_eig(pca_result, addlabels = TRUE, barfill = "skyblue") +
+  ggtitle("Scree Plot: Variance Explained by Principal Components")
+
+```
+
+```{r}
+
+
+
+# Get PCA scores (observations)
+scores <- as.data.frame(pca_result$x)
+scores$Country <- rownames(scores)  # Optional: add country/area names
+
+# Get PCA loadings (variable vectors)
+loadings <- as.data.frame(pca_result$rotation)
+loadings$Feature <- rownames(loadings)
+
+# Scale loadings to match the PCA space (just for visualization)
+loadings_scaled <- loadings
+loadings_scaled[, 1:2] <- loadings_scaled[, 1:2] * max(abs(scores[, 1:2]))
+
+# Plot
+ggplot(scores, aes(x = PC1, y = PC2)) +
+  geom_point(color = "gray40", alpha = 0.7) +
+  geom_segment(data = loadings_scaled,
+               aes(x = 0, y = 0, xend = PC1, yend = PC2),
+               arrow = arrow(length = unit(0.2, "cm")),
+               color = "steelblue") +
+  geom_text(data = loadings_scaled, aes(x = PC1, y = PC2, label = Feature),
+            color = "steelblue", vjust = 1.5, size = 3.5) +
+  labs(title = "PCA Biplot: Countries and Feature Directions") +
+  theme_minimal()
+
+
+
+```
+
+```{r}
+
+# Get PCA scores
+pca_scores <- as.data.frame(pca_result$x)
+
+# Add country or row ID if needed
+pca_scores$Country <- rownames(pca_scores)
+
+# Add Region info — be sure rownames match
+pca_scores$Region <- data_clean$Region[match(rownames(pca_scores), rownames(pca_scaled))]
+
+# Basic scatter plot colored by Region
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = Region)) +
+  geom_point(alpha = 0.8, size = 2.5) +
+  labs(title = "Countries Projected onto First 2 Principal Components",
+       x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+```
+
+```{r}
+fviz_pca_var(pca_result,
+             col.var = "contrib",
+             gradient.cols = c("blue", "orange", "red"),
+             repel = TRUE) +
+  ggtitle("Variable Contributions to Principal Components")
+
+```
+
+```{r}
+# Example: Set rownames if Area + Year are unique together
+rownames(pca_scaled) <- paste(data_clean$Area, data_clean$Year, sep = "_")
+
+pca_scores <- as.data.frame(pca_result$x)
+pca_scores$Region <- data_clean$Region[rownames(pca_scaled)]
+
+pca_scores <- as.data.frame(pca_result$x)
+
+
+```
+
+```{r}
+head(rownames(pca_scores))
+head(rownames(pca_scaled))
+head(data_clean$Region)
+
+```
+
+```{r}
+write.csv(pca_scores, "PCA_scores_with_regions.csv", row.names = FALSE)
+
+```
+
+```{r}
+
+
+# Determine  Number of Clusters using Elbow Method
+set.seed(123)
+wss <- vector()
+
+# Test cluster counts from 1 to 10 using top 2 principal components
+for (k in 1:10) {
+  kmeans_model <- kmeans(pca_scores[, 1:2], centers = k, nstart = 25)
+  wss[k] <- kmeans_model$tot.withinss
+}
+
+# Plot the Elbow Curve
+plot(1:10, wss, type = "b", pch = 19,
+     xlab = "Number of Clusters (k)",
+     ylab = "Total Within-Cluster Sum of Squares (WSS)",
+     main = "Elbow Method for Optimal k")
+abline(v = which.min(diff(diff(wss))) + 1, col = "red", lty = 2)
+
+
+
+```
+
+#Clustering based on PCA
+```{r}
+# Use only first 2 principal components for clustering
+set.seed(123)  # for reproducibility
+kmeans_result <- kmeans(pca_scores[, 1:2], centers = 4, nstart = 25)
+
+# Add cluster to PCA scores
+pca_scores$cluster <- as.factor(kmeans_result$cluster)
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(title = "K-Means Clustering on First 2 Principal Components") +
+  theme_minimal()
+
+```
+
+```{r}
+# Check the rownames of the scaled PCA data
+head(rownames(pca_scaled))
+
+# Check if they match your cleaned data
+head(rownames(data_clean))
+
+
+```
+
+```{r}
+# Reset rownames to ensure matching
+rownames(data_clean) <- NULL
+pca_scores$Region <- data_clean$Region
+
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = Region, shape = cluster)) +
+  geom_point(alpha = 0.8, size = 2) +
+  labs(title = "Clusters vs. Regions on PCA Projection") +
+  theme_minimal()
+
+```
+
+```{r}
+write.csv(pca_scores, file.path(Sys.getenv("USERPROFILE"), "Downloads", "PCA_scores_with_clusters.csv"), row.names = FALSE)
+
+```
+

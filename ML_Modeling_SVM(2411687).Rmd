@@ -1,0 +1,185 @@
+```{r}
+# Step 0: Load Libraries
+# install.packages("e1071")
+
+# Load required libraries
+library(readxl)
+library(dplyr)
+library(caret)
+library(ggplot2)
+library(e1071)     # for SVM modeling
+library(corrplot)
+library(magrittr)
+
+```
+
+```{r}
+# STEP 1: Load Data
+data <- read_excel("C:/Users/91886/Downloads/Agrofood_co2_emission_Final.xlsx")
+#Note:- Change the location to you default saved location of dataset to open it.
+```
+
+```{r}
+# Step 3: Clean Data
+# Remove identifier columns
+data <- data %>% select(-Region, -Area, -Year)
+
+# Remove features with low correlation to total_emission (< 0.2)
+cor_matrix <- cor(data, use = "complete.obs")
+target_cor <- cor_matrix[, "total_emission"]
+low_correlation <- names(target_cor[abs(target_cor) < 0.2])
+low_correlation <- setdiff(low_correlation, "total_emission")
+
+cat("Dropped due to low correlation: ", paste(low_correlation, collapse = ", "), "\n")
+data <- data %>% select(-all_of(low_correlation))
+
+```
+
+```{r}
+# Step 4: Prepare Data
+# Separate features and target
+X <- data %>% select(-total_emission)
+y <- data$total_emission
+
+```
+
+```{r}
+#Step 5: Train-Test Split
+# Create 70/30 split using caret
+set.seed(42)
+train_index <- createDataPartition(y, p = 0.7, list = FALSE)
+X_train <- X[train_index, ]
+y_train <- y[train_index]
+X_test <- X[-train_index, ]
+y_test <- y[-train_index]
+
+
+```
+
+```{r}
+# Step 6: Feature Scaling
+pre_proc <- preProcess(X_train, method = c("center", "scale"))
+X_train_scaled <- predict(pre_proc, X_train)
+X_test_scaled <- predict(pre_proc, X_test)
+```
+
+```{r}
+# Step 7: Hyperparameter Tuning with expand.grid
+tune_grid <- expand.grid(C = c(1, 10), sigma = c(0.01, 0.1))
+
+set.seed(42)
+svm_tuned <- train(
+  x = X_train_scaled, y = y_train,
+  method = "svmRadial",
+  trControl = trainControl(method = "cv", number = 5),
+  tuneGrid = tune_grid
+)
+```
+
+```{r}
+# Step 8: Predict Using Tuned Model
+y_pred <- predict(svm_tuned, newdata = X_test_scaled)
+
+```
+
+```{r}
+
+# Step 9: Evaluate Model Performance
+mse <- mean((y_test - y_pred)^2)
+rmse <- sqrt(mse)
+mae <- mean(abs(y_test - y_pred))
+r2 <- 1 - sum((y_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+
+cat("Performance Metrics (Tuned SVM with Scaling):\n")
+cat(sprintf("MSE: %.2f\nRMSE: %.2f\nMAE: %.2f\nR²: %.4f\n", mse, rmse, mae, r2))
+```
+
+```{r}
+# Step 9.1: Evaluate Training Performance for overfitting check 
+y_train_pred <- predict(svm_tuned, newdata = X_train_scaled)
+
+# Compute Training R²
+train_r2 <- 1 - sum((y_train - y_train_pred)^2) / sum((y_train - mean(y_train))^2)
+cat(sprintf("Training R²: %.4f\n", train_r2))
+
+```
+```{r}
+# Step 9.2: Inspect Support Vector Complexity
+num_sv <- length(svm_tuned$finalModel@SVindex)
+num_train <- nrow(X_train_scaled)
+
+cat(sprintf("Number of Support Vectors: %d\n", num_sv))
+cat(sprintf("Number of Training Observations: %d\n", num_train))
+cat(sprintf("SV Ratio: %.2f%%\n", 100 * num_sv / num_train))
+```
+
+
+```{r}
+```
+
+
+```{r}
+results <- data.frame(Actual = y_test, Predicted = y_pred)
+
+ggplot(results, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.6, color = "darkblue") +
+  geom_abline(linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "Tuned SVM: Actual vs Predicted CO₂ Emissions",
+       x = "Actual CO₂ Emissions",
+       y = "Predicted CO₂ Emissions")
+
+```
+```{r}
+residuals_df <- data.frame(Predicted = y_pred, Residuals = y_test - y_pred)
+
+ggplot(residuals_df, aes(x = Predicted, y = Residuals)) +
+  geom_point(alpha = 0.6, color = "tomato") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  theme_minimal() +
+  labs(title = "Residual Plot: Tuned SVM Model",
+       x = "Predicted CO₂ Emissions",
+       y = "Residuals (Actual - Predicted)")
+
+```
+```{r}
+# Step 10: Compute and Plot Feature Importance for SVM (caret-trained)
+# Step 10: Approximate Feature Importance using Support Vector Influence (Fixed)
+
+# Use @SVindex to extract support vector indices (S4 object)
+support_indices <- svm_tuned$finalModel@SVindex
+
+# Subset training data to just the support vectors
+X_support <- X_train_scaled[support_indices, ]
+
+# Compute standard deviation of each feature across support vectors
+feature_sd <- apply(X_support, 2, sd)
+
+# Convert to data frame
+importance_df <- data.frame(
+  Feature = names(feature_sd),
+  Overall = feature_sd
+)
+
+# Select top 15 features
+top_features <- importance_df %>%
+  arrange(desc(Overall)) %>%
+  head(15)
+
+# Plot top features
+ggplot(top_features, aes(x = reorder(Feature, Overall), y = Overall)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Top 15 Features (based on Support Vector Variability)",
+    x = "Feature",
+    y = "Standard Deviation across Support Vectors"
+  )
+
+
+
+```
+
+
+
